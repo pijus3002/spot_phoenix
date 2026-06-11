@@ -1,0 +1,4 @@
+pika
+azure-identity
+azure-mgmt-compute
+azure-mgmt-trafficmanager

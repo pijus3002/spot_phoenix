@@ -2,27 +2,16 @@
 
 ## Overview
 
-Spot Phoenix is an event-driven system designed to handle
-Azure Spot VM eviction events.
+Spot Phoenix is an event-driven system designed to automatically react to Azure Spot VM eviction events and perform recovery actions.
 
-The system continuously monitors Azure Scheduled Events metadata endpoints
-for eviction notifications. When an eviction event is detected, it is
-published to a RabbitMQ queue.
+The system continuously monitors Azure Scheduled Events metadata endpoints for eviction notifications. When an eviction event is detected, it is published to a RabbitMQ queue.
 
-A worker service consumes eviction events and performs contingency actions,
-such as:
-- removing the VM from traffic routing
-- disabling monitoring
-- waiting for a set delay and attempting VM restart or recovery
+A recovery worker consumes eviction events and performs actions:
 
----
-
-# Goals
-
-- Detect Azure Spot VM eviction warnings
-- Put eviction events into a message queue
-- Execute automated contingency actions
-- Attempt recovery after a set delay
+* removing the VM from Azure Traffic Manager routing
+* waiting for a configurable recovery delay
+* attempting VM restart using Azure Compute API
+* restoring traffic routing after successful recovery
 
 ---
 
@@ -32,14 +21,17 @@ such as:
 graph TD
 
     A[Azure Spot VM]
-    B[Eviction Listener]
+    B[Listener]
     C[RabbitMQ]
-    D[Recovery Worker]
-    E[Azure API]
+    D[Worker]
+    E[Azure Compute API]
+    F[Azure Traffic Manager]
 
     A --> B
     B --> C
     C --> D
+
+    D --> F
     D --> E
 ```
 
@@ -49,41 +41,51 @@ graph TD
 
 ## 1. Eviction Listener
 
-- Listen to Azure Scheduled Events endpoint (json)
-- Detect eviction notifications
-- Publish events into RabbitMQ
+The Listener service runs on the Spot VM and continuously monitors the Azure Scheduled Events metadata endpoint:
 
-Example eviction event:
+* Poll Azure Scheduled Events endpoint
+```text
+http://169.254.169.254/metadata/scheduledevents
+```
+* Detect eviction notifications (`Preempt`)
+* Deduplicate events
+* Publish eviction events to RabbitMQ
+
+Example published event:
 
 ```json
 {
-  "EventId":"258F9A75-A5C9-41BD-B952-3EF1E36C7467",
-  "EventStatus":"Scheduled",
-  "EventType":"Preempt",
-  "ResourceType":"VirtualMachine",
-  "Resources":["eviction-test"],
-  "NotBefore":"Mon, 23 May 2026 01:18:39 GMT",
-  "Description":"",
-  "EventSource":"Platform",
-  "DurationInSeconds":-1
+  "event_id": "258F9A75-A5C9-41BD-B952-3EF1E36C7467",
+  "event_type": "Preempt",
+  "vm_name": "eviction-test",
+  "resource_group": "eviction-test_group",
+  "not_before": "2026-05-23T01:18:39Z",
+  "detected_at": "2026-05-23T01:17:12Z"
 }
 ```
 
-## 2. Recovery Worker
+---
 
-- Consume eviction events
-- Execute contingency logic
-- Start restart countdown
-- Attempt VM restart
+## 2. RabbitMQ Message Broker
 
-Potential actions:
-- Remove VM from Azure Traffic Manager
-- Disable monitoring alerts
-- Drain active traffic
+RabbitMQ acts as a message queue between the Listener and Recovery Worker.
 
 ---
 
-# Event Flow
+## 3. Recovery Worker
+
+The Recovery Worker runs on a separate management VM:
+
+* Consume eviction events from RabbitMQ
+* Disable Traffic Manager endpoint
+* Wait for recovery countdown
+* Start the evicted VM using Azure Compute API
+* Verify VM power state
+* Re-enable Traffic Manager endpoint after successful recovery
+
+---
+
+# Sequence of actions
 
 ```mermaid
 sequenceDiagram
@@ -92,16 +94,27 @@ sequenceDiagram
     participant Listener
     participant RabbitMQ
     participant Worker
+    participant TrafficManager
+    participant ComputeAPI
 
-    Azure->>Listener: Eviction Warning
+    Azure->>Listener: Eviction event in metadata endpoint
+
     Listener->>RabbitMQ: Publish Event
+
     RabbitMQ->>Worker: Consume Event
 
-    Worker->>Worker: Disable Monitoring
-    Worker->>Worker: Remove From Traffic
-    Worker->>Worker: Wait Countdown
+    Worker->>TrafficManager: Disable Traffic manager Endpoint
 
-    Worker->>Azure: Attempt Restart
+    loop Until successful start
+
+        Worker->>Worker: Wait Recovery Delay
+
+        Worker->>ComputeAPI: Attempt to start VM
+    end
+
+    ComputeAPI-->>Worker: VM Running
+
+    Worker->>TrafficManager: Enable Traffic manager Endpoint
 ```
 
 ---
@@ -111,9 +124,14 @@ sequenceDiagram
 ```mermaid
 graph LR
 
-    subgraph Docker Environment
+    subgraph Spot_VM
 
         A[Listener Container]
+
+    end
+
+    subgraph Manager_VM
+
         B[RabbitMQ Container]
         C[Worker Container]
 
@@ -123,16 +141,7 @@ graph LR
     B --> C
 ```
 
----
-
-# Docker Deployment
-
-The system is deployed using Docker Compose.
-
-Services:
-- rabbitmq
-- listener
-- worker
+The solution is deployed using Docker containers.
 
 ---
 
@@ -140,16 +149,29 @@ Services:
 
 ## RabbitMQ Unavailable
 
-The listener retries connection attempts periodically.
+The Listener continuously retries RabbitMQ connections until successful.
 
-## Failed Recovery
+## Azure API Failure
 
-Restart attempts may be retried with exponential backoff.
+Worker exceptions result in RabbitMQ message requeueing, allowing future recovery attempts.
+
+## VM Recovery Failure
+
+If the VM does not reach the `PowerState/running` state, the message remains available for retry processing.
 
 ---
 
-# Assumptions
 
-- Spot VM eviction warnings arrive before termination.
+# Technologies Used
+
+* Python
+* Azure Spot Virtual Machines
+* Azure Scheduled Events
+* Azure Managed Identity
+* Azure Compute Management API
+* Azure Traffic Manager
+* RabbitMQ
+* Docker
+* Docker Compose
 
 ---

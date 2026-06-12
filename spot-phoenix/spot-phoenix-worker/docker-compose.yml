@@ -1,0 +1,17 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: spot-phoenix-rabbitmq
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      RABBITMQ_DEFAULT_USER: pijus
+      RABBITMQ_DEFAULT_PASS: qwerty123
+
+  worker:
+    build: ./worker
+    container_name: spot-phoenix-worker
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - rabbitmq
